@@ -1,0 +1,8 @@
+*
+!.gitignore
+!galeria_app.py
+!README.md
+!requirements.txt
+!iniciar_galeria.bat
+!assets/
+!assets/**
