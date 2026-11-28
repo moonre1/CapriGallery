@@ -75,6 +75,8 @@ MODELS = {
     "yunet.onnx": "https://github.com/opencv/opencv_zoo/raw/refs/heads/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
     "sface.onnx": "https://github.com/opencv/opencv_zoo/raw/refs/heads/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
 }
+FACE_SUGGESTION_MIN = 0.42     # similaridade mínima para sugerir um álbum
+FACE_SUGGESTION_STRONG = 0.50  # a partir daqui a sugestão já vem marcada
 CAPRI_DARK_BG = "#11141b"
 CAPRI_DARK_PANEL = "#1a2029"
 CAPRI_TEXT = "#eff0ee"
@@ -729,18 +731,22 @@ class SlimScrollbar(tk.Canvas):
         thumb_height = min(height - top, thumb_height)
         if thumb_height < 1 or Image is None:
             return
-        scale = 6
         width = max(1, self.winfo_width())
-        art = Image.new("RGBA", (width * scale, thumb_height * scale), (0, 0, 0, 0))
-        ImageDraw.Draw(art).rounded_rectangle(
-            (scale, 0, (width - 1) * scale, thumb_height * scale - 1),
-            radius=max(1, width * scale // 2),
-            fill=MUTED,
-        )
-        art = art.resize((width, thumb_height), Image.Resampling.LANCZOS)
-        if getattr(self._app, "_wallpaper_transparent", False):
-            art = _hard_alpha(art)
-        self._thumb_ref = ImageTk.PhotoImage(art, master=self)
+        transparent = bool(getattr(self._app, "_wallpaper_transparent", False))
+        thumb_key = (width, thumb_height, MUTED, transparent)
+        if getattr(self, "_thumb_key", None) != thumb_key or getattr(self, "_thumb_ref", None) is None:
+            scale = 4
+            art = Image.new("RGBA", (width * scale, thumb_height * scale), (0, 0, 0, 0))
+            ImageDraw.Draw(art).rounded_rectangle(
+                (scale, 0, (width - 1) * scale, thumb_height * scale - 1),
+                radius=max(1, width * scale // 2),
+                fill=MUTED,
+            )
+            art = art.resize((width, thumb_height), Image.Resampling.LANCZOS)
+            if transparent:
+                art = _hard_alpha(art)
+            self._thumb_ref = ImageTk.PhotoImage(art, master=self)
+            self._thumb_key = thumb_key
         self.create_image(width // 2, top, image=self._thumb_ref, anchor="n")
 
     def refresh_wallpaper_surface(self):
@@ -764,9 +770,11 @@ class SlimScrollbar(tk.Canvas):
 class RoundedButton(tk.Canvas):
     """Canvas button with an antialiased 14px shape and nonblocking color transitions."""
 
-    def __init__(self, master, *, text="", command=None, width=140, height=40, primary=False, state="normal", style=None):
+    def __init__(self, master, *, text="", command=None, width=140, height=40, primary=False, state="normal", style=None, fluid=False):
         self._surface_bg = self._surface_color(master)
-        super().__init__(master, width=width, height=height, bg=self._surface_bg, bd=0, highlightthickness=0, cursor="hand2", takefocus=1)
+        # Um botão "fluido" pede largura mínima e deixa o pack(fill="x") definir o tamanho real.
+        super().__init__(master, width=1 if fluid else width, height=height, bg=self._surface_bg, bd=0, highlightthickness=0, cursor="hand2", takefocus=1)
+        self._fluid = bool(fluid)
         self._text = str(text)
         self._command = command
         self._primary = bool(primary)
@@ -860,13 +868,18 @@ class RoundedButton(tk.Canvas):
                 self.after_cancel(self._redraw_after_id)
             except tk.TclError:
                 pass
-        self._redraw_after_id = self.after(40, self._draw_button)
+        self._redraw_after_id = self.after(30, self._draw_button)
 
     def _draw_button(self):
         self._redraw_after_id = None
         try:
-            width = max(1, self.winfo_width(), self.winfo_reqwidth())
-            height = max(1, self.winfo_height(), self.winfo_reqheight())
+            # Desenha sempre no tamanho real do widget; o tamanho pedido só vale antes de ele ser exibido.
+            width = self.winfo_width()
+            if width <= 1:
+                width = self.winfo_reqwidth()
+            height = self.winfo_height()
+            if height <= 1:
+                height = self.winfo_reqheight()
             if width <= 1 or height <= 1 or Image is None:
                 return
             scale = 4
@@ -916,13 +929,15 @@ class RoundedButton(tk.Canvas):
             available_text_width = max(1, width - 24)
             if (self._icon_photo is not None and self._image_compound == "left") or is_sidebar:
                 available_text_width = max(1, width - text_x - 8)
-            while font_size > 7 and tkfont.Font(
-                root=self,
-                family="Inter",
-                size=font_size,
-                weight="bold",
-            ).measure(text) > available_text_width:
+            text_font = tkfont.Font(root=self, family="Inter", size=font_size, weight="bold")
+            while font_size > 7 and text_font.measure(text) > available_text_width:
                 font_size -= 1
+                text_font = tkfont.Font(root=self, family="Inter", size=font_size, weight="bold")
+            if text_font.measure(text) > available_text_width:
+                trimmed = text
+                while len(trimmed) > 1 and text_font.measure(trimmed + "…") > available_text_width:
+                    trimmed = trimmed[:-1]
+                text = trimmed.rstrip() + "…"
             self.create_text(
                 text_x,
                 height / 2,
@@ -1291,6 +1306,7 @@ class RoundedControl(RoundedButton):
         primary=False,
         state="normal",
         style=None,
+        fluid=False,
     ):
         self.kind = kind
         self._dropdown_values = list(values or ())
@@ -1311,6 +1327,7 @@ class RoundedControl(RoundedButton):
                 primary=primary,
                 state="disabled" if state == "disabled" else "normal",
                 style=style or "Dropdown.TButton",
+                fluid=fluid,
             )
             self._dropdown_trace = self._dropdown_variable.trace_add("write", self._sync_dropdown_caption)
             self._sync_dropdown_caption()
@@ -1328,6 +1345,7 @@ class RoundedControl(RoundedButton):
                 primary=primary,
                 state=state,
                 style=style or ("Accent.TButton" if primary else "TButton"),
+                fluid=fluid,
             )
 
     def _cleanup_dropdown(self, event=None):
@@ -1696,63 +1714,103 @@ class GalleryApp(tk.Tk):
             self._apply_sidebar_width(width)
             if self.store.setting("sidebar_width", "") != str(width):
                 self.store.set_setting("sidebar_width", str(width))
+                self._schedule_full_repaint()
         except (IndexError, tk.TclError, sqlite3.Error) as exc:
             if isinstance(exc, sqlite3.Error):
                 messagebox.showerror("Falha ao salvar a barra lateral", str(exc), parent=self)
 
     def _queue_sidebar_responsive_layout(self, _event=None):
-        pending = getattr(self, "_sidebar_responsive_after_id", None)
-        if pending:
-            try:
-                self.after_cancel(pending)
-            except tk.TclError:
-                pass
-        self._sidebar_responsive_after_id = self.after(80, self._apply_sidebar_responsive_layout)
+        # Barato o bastante para acompanhar o arraste da barra sem atraso.
+        if not hasattr(self, "side"):
+            return
+        try:
+            width = self.side.winfo_width()
+        except tk.TclError:
+            return
+        if width == getattr(self, "_sidebar_layout_width", None):
+            return
+        self._apply_sidebar_responsive_layout()
+
+    def _brand_logo_photo(self, size):
+        cache = getattr(self, "_brand_logo_cache", None)
+        if cache is None:
+            cache = self._brand_logo_cache = {}
+        photo = cache.get(size)
+        if photo is None and self._capri_brand_original is not None:
+            image = self._capri_brand_original.resize((size, size), Image.Resampling.LANCZOS)
+            photo = cache[size] = ImageTk.PhotoImage(image, master=self)
+        return photo
+
+    def _fit_sidebar_brand(self, side_width):
+        """Escala logo e título juntos para caberem na largura, sem mexer na altura do bloco."""
+        if not hasattr(self, "brand_title"):
+            return
+        inner = max(120, side_width - 40)
+        has_logo = self._capri_brand_original is not None
+        logo = max(40, min(64, round(inner * 0.24))) if has_logo else 0
+        gap = max(8, round(logo * 0.18)) if has_logo else 0
+        available = max(40, inner - logo - gap - 6)
+        size = 28
+        while size > 12:
+            measured = tkfont.Font(root=self, family="Cyberpunk", size=size).measure("Capri")
+            if measured <= available:
+                break
+            size -= 1
+        if getattr(self, "_brand_font_size", None) != size:
+            self._brand_font_size = size
+            self.brand_title.configure(font=("Cyberpunk", size))
+        if has_logo and getattr(self, "_brand_logo_size", None) != logo:
+            photo = self._brand_logo_photo(logo)
+            if photo is not None:
+                self._brand_logo_size = logo
+                self.brand_mark.configure(image=photo)
+                self.brand_mark.image = photo
+        self.brand_copy.pack_configure(padx=(gap, 0))
 
     def _apply_sidebar_responsive_layout(self):
         self._sidebar_responsive_after_id = None
         if not hasattr(self, "side") or not self.side.winfo_exists():
             return
         width = self.side.winfo_width()
-        narrow = width < 260
-        if hasattr(self, "brand"):
-            self.brand.pack_configure(padx=14 if narrow else 20, pady=(18, 24) if narrow else (24, 34))
-            self.brand_copy.pack_configure(padx=(8 if narrow else 12, 0))
-            self.brand_title.configure(font=("Cyberpunk", 20 if narrow else 28))
-        if hasattr(self, "privacy_text"):
-            self.privacy_text.configure(wraplength=max(120, width - 54))
-        if hasattr(self, "sidebar_album_control"):
-            self.sidebar_album_control.configure(width=18 if narrow else 22)
         if width <= 1:
             width = self.sidebar_width
-        for button in tuple(getattr(self, "_rounded_buttons", ())):
+        self._sidebar_layout_width = width
+        self._fit_sidebar_brand(width)
+        if hasattr(self, "privacy_text"):
+            self.privacy_text.configure(wraplength=max(100, width - 56))
+
+    def _schedule_full_repaint(self, delay=120):
+        pending = getattr(self, "_full_repaint_after_id", None)
+        if pending:
             try:
-                if not button.winfo_exists():
-                    continue
-                ancestor = button.master
-                while ancestor is not None and ancestor is not self.side:
-                    ancestor = getattr(ancestor, "master", None)
-                if ancestor is not self.side:
-                    continue
-                parent_width = button.master.winfo_width()
-                if parent_width <= 1:
-                    parent_width = width
-                try:
-                    padding = button.pack_info().get("padx", 0)
-                    padding_parts = padding if isinstance(padding, (tuple, list)) else str(padding).split()
-                    padding_total = sum(max(0, int(float(value))) for value in padding_parts)
-                except (tk.TclError, TypeError, ValueError):
-                    padding_total = 0
-                button_width = max(110, parent_width - padding_total - 4)
-                if button.winfo_reqwidth() != button_width:
-                    button.configure(width=button_width)
-                    button.refresh_theme()
+                self.after_cancel(pending)
             except tk.TclError:
-                continue
-        style = ttk.Style(self)
-        button_font = ("Inter", 9 if narrow else 10, "bold")
-        style.configure("Sidebar.TButton", font=button_font)
-        style.configure("Sidebar.Active.TButton", font=button_font)
+                pass
+        try:
+            self._full_repaint_after_id = self.after(delay, self._force_full_repaint)
+        except tk.TclError:
+            self._full_repaint_after_id = None
+
+    def _force_full_repaint(self):
+        """Invalida a janela inteira para apagar restos de desenho deixados por repinturas atrasadas."""
+        self._full_repaint_after_id = None
+        try:
+            self.update_idletasks()
+            if os.name != "nt":
+                return
+            user32 = ctypes.WinDLL("user32")
+            get_ancestor = user32.GetAncestor
+            get_ancestor.argtypes = (ctypes.c_void_p, ctypes.c_uint)
+            get_ancestor.restype = ctypes.c_void_p
+            redraw = user32.RedrawWindow
+            redraw.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint)
+            redraw.restype = ctypes.c_int
+            hwnd = get_ancestor(ctypes.c_void_p(self.winfo_id()), 2)
+            if hwnd:
+                # RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW
+                redraw(hwnd, None, None, 0x0001 | 0x0004 | 0x0080 | 0x0100)
+        except (AttributeError, OSError, tk.TclError):
+            pass
 
     @staticmethod
     def _make_window_nonactivating(window):
@@ -2159,22 +2217,26 @@ class GalleryApp(tk.Tk):
             showhandle=True,
             handlesize=12,
             handlepad=5,
-            opaqueresize=True,
+            opaqueresize=False,
         )
         shell.pack(fill="both", expand=True)
         self.shell = shell
-        shell.bind("<ButtonRelease-1>", self._persist_sidebar_sash, add="+")
+        # com opaqueresize=False o Tk só aplica a nova posição depois deste evento; por isso o atraso
+        shell.bind("<ButtonRelease-1>", lambda _event: self.after(60, self._persist_sidebar_sash), add="+")
         side = tk.Frame(shell, bg=PANEL, width=self.sidebar_width, highlightthickness=0, bd=0)
         self.side = side
 
-        brand = tk.Frame(side, bg=PANEL)
+        brand = tk.Frame(side, bg=PANEL, height=64)
         self.brand = brand
-        brand.pack(fill="x", padx=20, pady=(24, 34))
+        brand.pack(fill="x", padx=20, pady=(24, 30))
+        brand.pack_propagate(False)
         mark = tk.Label(brand, image=self._capri_logo_photo, bg=PANEL, bd=0)
         mark.pack(side="left", anchor="center")
+        self.brand_mark = mark
         brand_copy = tk.Frame(brand, bg=PANEL)
         self.brand_copy = brand_copy
-        brand_copy.pack(side="left", padx=12, fill="both", expand=True)
+        brand_copy.pack_propagate(False)
+        brand_copy.pack(side="left", padx=(12, 0), fill="both", expand=True)
         self.brand_title = tk.Label(
             brand_copy,
             text="Capri",
@@ -2200,27 +2262,10 @@ class GalleryApp(tk.Tk):
         if self.sidebar_album_mode not in sidebar_modes:
             self.sidebar_album_mode = "compact_grid"
         self.sidebar_album_view = tk.StringVar(value=sidebar_modes[self.sidebar_album_mode])
-        sidebar_view = self._rounded_dropdown(side, textvariable=self.sidebar_album_view, values=list(sidebar_modes.values()), width=22)
+        sidebar_view = self._rounded_dropdown(side, textvariable=self.sidebar_album_view, values=list(sidebar_modes.values()), width=22, fluid=True)
         self.sidebar_album_control = sidebar_view
         sidebar_view.pack(fill="x", padx=17, pady=(0, 7))
         sidebar_view.bind("<<ComboboxSelected>>", self.change_sidebar_album_view)
-        album_wrap = tk.Frame(side, bg=PANEL)
-        album_wrap.pack(fill="both", expand=True, padx=(10, 6), pady=(0, 2))
-        self.album_canvas = tk.Canvas(album_wrap, bg=PANEL, highlightthickness=0)
-        self.album_scroll = SlimScrollbar(album_wrap, command=self.album_canvas.yview)
-        self.album_canvas._galeria_scrollbar = self.album_scroll
-        self.album_scroll._galeria_area = self.album_canvas
-        self.album_canvas.configure(yscrollcommand=self.album_scroll.set)
-        self.album_canvas.pack(side="left", fill="both", expand=True)
-        self.album_scroll.pack(side="right", fill="y")
-        self.album_list = tk.Frame(self.album_canvas, bg=PANEL)
-        self._album_list_window = self.album_canvas.create_window((0, 0), window=self.album_list, anchor="nw")
-        self.album_list.bind("<Configure>", lambda _event: self.after_idle(self._update_album_list_scroll_region))
-        self.album_canvas.bind("<Configure>", lambda event: self.album_canvas.itemconfigure(self._album_list_window, width=event.width))
-        self.album_canvas.bind("<Configure>", self._queue_sidebar_layout_refresh, add="+")
-        self._register_scroll_canvas(self, self.album_canvas)
-        self._pill_button(side, "＋  Criar álbum", self.create_album, primary=True, width=236).pack(fill="x", padx=17, pady=(15, 5))
-        self._pill_button(side, "Selecionar / excluir álbuns", self.delete_multiple_albums, width=236).pack(fill="x", padx=17, pady=4)
         privacy_note = tk.Frame(side, bg=PANEL)
         privacy_note.pack(side="bottom", fill="x", anchor="w", padx=19, pady=(0, 18))
         privacy_heading = tk.Frame(privacy_note, bg=PANEL)
@@ -2240,6 +2285,27 @@ class GalleryApp(tk.Tk):
             anchor="w",
         )
         self.privacy_text.pack(fill="x", anchor="w", padx=(17, 0))
+        self._pill_button(side, "Selecionar / excluir álbuns", self.delete_multiple_albums, width=236, fluid=True).pack(
+            side="bottom", fill="x", padx=17, pady=(4, 16)
+        )
+        self._pill_button(side, "＋  Criar álbum", self.create_album, primary=True, width=236, fluid=True).pack(
+            side="bottom", fill="x", padx=17, pady=(12, 4)
+        )
+        album_wrap = tk.Frame(side, bg=PANEL)
+        album_wrap.pack(fill="both", expand=True, padx=(10, 6), pady=(0, 2))
+        self.album_canvas = tk.Canvas(album_wrap, bg=PANEL, highlightthickness=0, height=60)
+        self.album_scroll = SlimScrollbar(album_wrap, command=self.album_canvas.yview)
+        self.album_canvas._galeria_scrollbar = self.album_scroll
+        self.album_scroll._galeria_area = self.album_canvas
+        self.album_canvas.configure(yscrollcommand=self.album_scroll.set)
+        self.album_canvas.pack(side="left", fill="both", expand=True)
+        self.album_scroll.pack(side="right", fill="y")
+        self.album_list = tk.Frame(self.album_canvas, bg=PANEL)
+        self._album_list_window = self.album_canvas.create_window((0, 0), window=self.album_list, anchor="nw")
+        self.album_list.bind("<Configure>", lambda _event: self.after_idle(self._update_album_list_scroll_region))
+        self.album_canvas.bind("<Configure>", lambda event: self.album_canvas.itemconfigure(self._album_list_window, width=event.width))
+        self.album_canvas.bind("<Configure>", self._queue_sidebar_layout_refresh, add="+")
+        self._register_scroll_canvas(self, self.album_canvas)
 
         main = tk.Frame(shell, bg=BG)
         self.main = main
@@ -2654,6 +2720,7 @@ class GalleryApp(tk.Tk):
             pass
         self._grid_swap = None
         self._update_scroll_region()
+        self._schedule_full_repaint()
 
     def _on_mousewheel(self, event):
         try:
@@ -2733,10 +2800,13 @@ class GalleryApp(tk.Tk):
             eased = 1 - (1 - progress) ** 3
             position = state["start"] + (state["target"] - state["start"]) * eased
             canvas.yview_moveto(position / state["extent"])
+            # Pinta cada quadro antes de agendar o próximo; sem isso o Tk acumula trabalho e deixa restos na tela.
+            canvas.update_idletasks()
             if progress < 1:
                 state["after"] = canvas.after(16, advance)
             else:
                 self._scroll_animation_jobs.pop(canvas, None)
+                self._schedule_full_repaint()
                 if canvas is getattr(self, "canvas", None):
                     self._maybe_load_more_photos()
 
@@ -2834,7 +2904,7 @@ class GalleryApp(tk.Tk):
             elif getattr(bar, "visible", False) and not getattr(bar, "_hide_id", None):
                 bar.hide_later()
 
-    def _pill_button(self, parent, text, command, primary=False, width=140, state="normal", style=None):
+    def _pill_button(self, parent, text, command, primary=False, width=140, state="normal", style=None, fluid=False):
         button = RoundedButton(
             parent,
             text=text,
@@ -2843,6 +2913,7 @@ class GalleryApp(tk.Tk):
             primary=primary,
             state=state,
             style=style,
+            fluid=fluid,
         )
         if getattr(self, "_wallpaper_enabled", False) and button.winfo_toplevel() is self:
             self._enable_wallpaper_surfaces((button,))
@@ -2910,8 +2981,8 @@ class GalleryApp(tk.Tk):
             except tk.TclError:
                 continue
 
-    def _rounded_dropdown(self, parent, *, textvariable, values, width=18, state="readonly"):
-        return RoundedControl(parent, kind="dropdown", textvariable=textvariable, values=values, width=width, state=state)
+    def _rounded_dropdown(self, parent, *, textvariable, values, width=18, state="readonly", fluid=False):
+        return RoundedControl(parent, kind="dropdown", textvariable=textvariable, values=values, width=width, state=state, fluid=fluid)
 
     @staticmethod
     def _round_rect(canvas, x1, y1, x2, y2, r, fill, outline):
@@ -2927,7 +2998,7 @@ class GalleryApp(tk.Tk):
         tk.Label(parent, text=text, bg=PANEL, fg=MUTED, font=("Inter", 8, "bold")).pack(anchor="w", padx=20, pady=(top, 8))
 
     def _side_button(self, parent, text, command):
-        b = self._pill_button(parent, text, command, width=236, style="Sidebar.TButton")
+        b = self._pill_button(parent, text, command, width=236, style="Sidebar.TButton", fluid=True)
         b.pack(fill="x", padx=13, pady=3)
         return b
 
@@ -2956,8 +3027,24 @@ class GalleryApp(tk.Tk):
         self.album_canvas.yview_moveto(0)
         self._refresh_albums()
 
+    @staticmethod
+    def _sidebar_grid_metrics(available, compact):
+        """Colunas e miniatura que preenchem a largura disponível sem sobras nem cortes."""
+        available = max(1, int(available))
+        min_cell = 84 if compact else 112
+        columns = max(1, min(3, available // min_cell))
+        cell_width = max(1, available // columns)
+        # 8 px de margem da grade + 12 px de respiro interno do cartão
+        thumb_size = max(40, min(96 if compact else 140, cell_width - 20))
+        thumb_size = max(40, thumb_size // 4 * 4)
+        return columns, thumb_size, cell_width
+
     def _queue_sidebar_layout_refresh(self, _event=None):
         if not self.sidebar_album_mode.endswith("grid"):
+            return
+        compact = self.sidebar_album_mode == "compact_grid"
+        columns, thumb_size, _cell = self._sidebar_grid_metrics(self.album_canvas.winfo_width(), compact)
+        if getattr(self, "_sidebar_grid_signature", None) == (self.sidebar_album_mode, columns, thumb_size):
             return
         pending = getattr(self, "_sidebar_layout_after_id", None)
         if pending:
@@ -3013,12 +3100,8 @@ class GalleryApp(tk.Tk):
         compact = mode in ("compact_grid", "compact_list")
         is_grid = mode in ("compact_grid", "grid")
         if is_grid:
-            available = max(1, self.album_canvas.winfo_width())
-            gutter = 8
-            min_cell = 76 if compact else 108
-            columns = max(1, min(3, (available + gutter) // (min_cell + gutter)))
-            cell_width = max(1, (available - gutter * (columns - 1)) // columns)
-            thumb_size = max(40, min(96 if not compact else 72, cell_width - 24))
+            columns, thumb_size, cell_width = self._sidebar_grid_metrics(self.album_canvas.winfo_width(), compact)
+            self._sidebar_grid_signature = (mode, columns, thumb_size)
             previous_columns = getattr(self, "_sidebar_album_columns", 0)
             for column in range(max(previous_columns, columns)):
                 self.album_list.grid_columnconfigure(
@@ -3120,6 +3203,7 @@ class GalleryApp(tk.Tk):
                     lambda i=album_id, n=name: self.open_album(i, n),
                     width=max(120, min(236, len(name) * 7 + 62)),
                     style="Sidebar.Active.TButton" if album_id == self.active_album else "Sidebar.TButton",
+                    fluid=True,
                 )
                 self._set_album_drop_target(button, album_id, name)
                 button.pack(fill="x", pady=1)
@@ -4827,18 +4911,27 @@ class GalleryApp(tk.Tk):
         self._show_progress(f"Analisando {len(candidates):,} arquivos de imagem…", 0, len(candidates))
         try:
             recovered = self.store.relink_missing_files(candidates)
+            known_photos = {os.path.normcase(path) for path in self.store.photos()}
         except sqlite3.Error as exc:
             self._import_busy = False
             self.configure(cursor="")
             self._hide_progress()
             messagebox.showerror("Falha ao atualizar a biblioteca", str(exc), parent=self)
             return
+        new_paths, seen_new = [], set()
+        for value in candidates:
+            resolved = _safe_resolve(value)
+            key = os.path.normcase(resolved)
+            if key not in known_photos and key not in seen_new:
+                seen_new.add(key)
+                new_paths.append(resolved)
         self._import_state = {
             "source": source,
             "paths": candidates,
             "index": 0,
             "added": 0,
             "recovered": recovered,
+            "new_paths": new_paths,
         }
         self._index_import_batch()
 
@@ -6877,9 +6970,19 @@ class GalleryApp(tk.Tk):
         if self._library_move_busy:
             self._notify("Aguarde a movimentação de fotos terminar.")
             return
-        paths = self.store.photos()
-        if not refs or not paths:
+        all_paths = self.store.photos()
+        if not refs or not all_paths:
             self._info("Fotos insuficientes", "Adicione fotos à biblioteca e escolha uma referência válida.", parent=self)
+            return
+        # Fotos que já estão no álbum de destino não precisam ser analisadas nem aparecer na revisão.
+        already_in_album = {os.path.normcase(path) for path in self.store.photos(album_id=target_id)}
+        paths = [path for path in all_paths if os.path.normcase(path) not in already_in_album]
+        if not paths:
+            self._info(
+                "Nada novo para buscar",
+                f"Todas as fotos da biblioteca já estão no álbum “{target_name}”.",
+                parent=self,
+            )
             return
         self.configure(cursor="watch")
         self._show_progress("Preparando o reconhecimento facial…")
@@ -6891,65 +6994,7 @@ class GalleryApp(tk.Tk):
 
     def _reference_worker(self, paths, refs, label, target_id, target_name):
         try:
-            import cv2
-            import numpy as np
-            from urllib.parse import urlparse
-
-            MODEL_DIR.mkdir(parents=True, exist_ok=True)
-            for name, url in MODELS.items():
-                target = MODEL_DIR / name
-                if target.exists() and target.stat().st_size > 1024:
-                    continue
-                parsed = urlparse(url)
-                if parsed.scheme != "https" or parsed.hostname != "github.com":
-                    raise RuntimeError("A origem do modelo facial não passou pela validação HTTPS.")
-                temp = target.with_suffix(".download")
-                request = urllib.request.Request(url, headers={"User-Agent": "Capri/1.0"})
-                written = 0
-                try:
-                    with urllib.request.urlopen(request, timeout=30) as response, temp.open("wb") as output:
-                        while chunk := response.read(1024 * 1024):
-                            written += len(chunk)
-                            if written > 100 * 1024 * 1024:
-                                raise RuntimeError("O modelo facial excedeu o tamanho permitido de 100 MB.")
-                            output.write(chunk)
-                    if written < 1024:
-                        raise RuntimeError("O download do modelo facial parece incompleto.")
-                    temp.replace(target)
-                finally:
-                    if temp.exists():
-                        temp.unlink()
-            detector = cv2.FaceDetectorYN.create(str(MODEL_DIR / "yunet.onnx"), "", (320, 320), 0.75, 0.3, 5000)
-            recognizer = cv2.FaceRecognizerSF.create(str(MODEL_DIR / "sface.onnx"), "")
-
-            def features(path):
-                try:
-                    with _FILE_IO_LOCK:
-                        encoded = np.fromfile(str(path), dtype=np.uint8)
-                    image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
-                except (OSError, ValueError):
-                    image = None
-                if image is None:
-                    return []
-                h, w = image.shape[:2]
-                if max(h, w) > 1800:
-                    scale = 1800 / max(h, w)
-                    image = cv2.resize(image, (int(w * scale), int(h * scale)))
-                    h, w = image.shape[:2]
-                detector.setInputSize((w, h))
-                found = detector.detect(image)[1]
-                if found is None:
-                    return []
-                out = []
-                for face in found:
-                    if float(face[-1]) < 0.8:
-                        continue
-                    feature = recognizer.feature(recognizer.alignCrop(image, face)).reshape(-1).astype("float32")
-                    norm = float((feature @ feature) ** 0.5)
-                    if norm:
-                        out.append(feature / norm)
-                return out
-
+            features = self._face_feature_extractor()
             reference = [f for p in refs for f in features(p)]
             matched = []
             for index, p in enumerate(paths, 1):
@@ -6962,10 +7007,481 @@ class GalleryApp(tk.Tk):
         except Exception as exc:
             self.worker_queue.put(("error", str(exc)))
 
+    def _face_feature_extractor(self):
+        """Prepara os modelos locais e devolve uma função que extrai os vetores faciais de uma foto."""
+        import cv2
+        import numpy as np
+        from urllib.parse import urlparse
+
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        for name, url in MODELS.items():
+            target = MODEL_DIR / name
+            if target.exists() and target.stat().st_size > 1024:
+                continue
+            parsed = urlparse(url)
+            if parsed.scheme != "https" or parsed.hostname != "github.com":
+                raise RuntimeError("A origem do modelo facial não passou pela validação HTTPS.")
+            temp = target.with_suffix(".download")
+            request = urllib.request.Request(url, headers={"User-Agent": "Capri/1.0"})
+            written = 0
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response, temp.open("wb") as output:
+                    while chunk := response.read(1024 * 1024):
+                        written += len(chunk)
+                        if written > 100 * 1024 * 1024:
+                            raise RuntimeError("O modelo facial excedeu o tamanho permitido de 100 MB.")
+                        output.write(chunk)
+                if written < 1024:
+                    raise RuntimeError("O download do modelo facial parece incompleto.")
+                temp.replace(target)
+            finally:
+                if temp.exists():
+                    temp.unlink()
+        detector = cv2.FaceDetectorYN.create(str(MODEL_DIR / "yunet.onnx"), "", (320, 320), 0.75, 0.3, 5000)
+        recognizer = cv2.FaceRecognizerSF.create(str(MODEL_DIR / "sface.onnx"), "")
+
+        def features(path):
+            try:
+                with _FILE_IO_LOCK:
+                    encoded = np.fromfile(str(path), dtype=np.uint8)
+                image = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+            except (OSError, ValueError):
+                image = None
+            if image is None:
+                return []
+            h, w = image.shape[:2]
+            if max(h, w) > 1800:
+                scale = 1800 / max(h, w)
+                image = cv2.resize(image, (int(w * scale), int(h * scale)))
+                h, w = image.shape[:2]
+            detector.setInputSize((w, h))
+            found = detector.detect(image)[1]
+            if found is None:
+                return []
+            out = []
+            for face in found:
+                if float(face[-1]) < 0.8:
+                    continue
+                feature = recognizer.feature(recognizer.alignCrop(image, face)).reshape(-1).astype("float32")
+                norm = float((feature @ feature) ** 0.5)
+                if norm:
+                    out.append(feature / norm)
+            return out
+
+        return features
+
+    def _cached_face_features(self, features, path):
+        cache = self.__dict__.setdefault("_face_feature_cache", {})
+        try:
+            stat = Path(path).stat()
+            key = (str(path), stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return []
+        found = cache.get(key)
+        if found is None:
+            found = features(path)
+            if len(cache) > 4000:
+                cache.clear()
+            cache[key] = found
+        return found
+
+    def _offer_face_suggestions(self, new_paths):
+        """Depois de importar, pergunta se o usuário quer sugestões de álbum por reconhecimento facial."""
+        if getattr(self, "_suggest_busy", False) or self._library_move_busy:
+            return
+        new_paths = [path for path in dict.fromkeys(new_paths) if _safe_is_file(path)]
+        if not new_paths:
+            return
+        albums = []
+        for album in self.store.albums():
+            if album[3] > 0:
+                album_paths = [path for path in self.store.photos(album_id=album[0]) if _safe_is_file(path)]
+                if album_paths:
+                    albums.append((album[0], album[1], album_paths))
+        if not albums:
+            return
+        if not messagebox.askyesno(
+            "Sugerir álbuns por rosto?",
+            f"Quer fazer um reconhecimento facial prévio nas {self._photo_count(len(new_paths))} novas? "
+            "Vou comparar os rostos com os álbuns que você já tem e sugerir onde cada foto se encaixa. "
+            "Tudo roda neste computador, e nada é adicionado a um álbum sem a sua aprovação.",
+            parent=self,
+        ):
+            return
+        self._suggest_busy = True
+        self.configure(cursor="watch")
+        self._show_progress("Preparando o reconhecimento facial…")
+        threading.Thread(
+            target=self._suggestion_worker,
+            args=(new_paths, albums),
+            name="Capri-sugere-albuns",
+            daemon=True,
+        ).start()
+
+    def _suggestion_worker(self, new_paths, albums):
+        try:
+            import numpy as np
+
+            features = self._face_feature_extractor()
+            samples = []
+            for album_id, name, album_paths in albums:
+                usable = list(album_paths)
+                if len(usable) > 40:
+                    step = len(usable) / 40
+                    usable = [usable[int(i * step)] for i in range(40)]
+                samples.append((album_id, name, usable))
+            total = sum(len(usable) for _id, _name, usable in samples) + len(new_paths)
+            done = 0
+            album_faces = []
+            for album_id, name, usable in samples:
+                vectors = []
+                for path in usable:
+                    vectors.extend(self._cached_face_features(features, path))
+                    done += 1
+                    if done == 1 or done % 5 == 0 or done == total:
+                        self.worker_queue.put(("suggest_progress", done, total))
+                if vectors:
+                    album_faces.append((album_id, name, np.stack(vectors)))
+            if not album_faces:
+                self.worker_queue.put(("suggest_done", [], len(new_paths)))
+                return
+            results = []
+            unmatched = 0
+            for path in new_paths:
+                faces = features(path)
+                done += 1
+                if done % 5 == 0 or done == total:
+                    self.worker_queue.put(("suggest_progress", done, total))
+                if not faces:
+                    unmatched += 1
+                    continue
+                face_matrix = np.stack(faces)
+                scored = []
+                for album_id, name, matrix in album_faces:
+                    score = float((face_matrix @ matrix.T).max())
+                    if score >= FACE_SUGGESTION_MIN:
+                        scored.append((album_id, name, score))
+                if not scored:
+                    unmatched += 1
+                    continue
+                scored.sort(key=lambda item: item[2], reverse=True)
+                results.append((path, scored[:3]))
+            results.sort(key=lambda item: (item[1][0][1].casefold(), -item[1][0][2]))
+            self.worker_queue.put(("suggest_done", results, unmatched))
+        except Exception as exc:
+            self.worker_queue.put(("suggest_error", str(exc)))
+
+    def _start_suggestion_apply(self, assignments):
+        """Adiciona as fotos aprovadas aos álbuns escolhidos e move os arquivos para as pastas deles."""
+        if self._library_move_busy:
+            self._notify("Aguarde a movimentação de fotos terminar.")
+            return False
+        total = sum(len(item[1]) for item in assignments.values())
+        if not total:
+            return False
+        if not self._ensure_library_destination():
+            return False
+        destination = self.destination
+        self._library_move_busy = True
+        self.configure(cursor="watch")
+        self._show_progress(f"Adicionando {self._photo_count(total)} aos álbuns…", 0, len(assignments))
+
+        def apply_assignments():
+            moved = skipped = 0
+            errors = []
+            for index, (album_id, (name, paths)) in enumerate(assignments.items(), 1):
+                try:
+                    self.store.assign(album_id, paths)
+                    album_moved, album_skipped = self.store.move_to_album_folder(album_id, name, paths, destination)
+                    moved += album_moved
+                    skipped += album_skipped
+                except (OSError, sqlite3.Error, ValueError) as exc:
+                    errors.append(f"{name}: {exc}")
+                self.worker_queue.put(("suggestions_progress", index, len(assignments), name))
+            self.worker_queue.put(("suggestions_applied", total, len(assignments), moved, skipped, errors))
+
+        threading.Thread(target=apply_assignments, name="Capri-aplica-sugestoes", daemon=True).start()
+        return True
+
+    def review_album_suggestions(self, suggestions, without_match=0):
+        """Tela de revisão: aprovar, rejeitar e trocar o álbum sugerido para cada foto nova."""
+        suggestions = [(path, list(found)) for path, found in suggestions if found and _safe_is_file(path)]
+        if not suggestions:
+            extra = f" {self._photo_count(without_match)} sem rosto parecido ficaram sem sugestão." if without_match else ""
+            self._info("Sem sugestões", "Não encontrei rostos parecidos com os dos seus álbuns." + extra)
+            return
+        popup = tk.Toplevel(self)
+        popup.title("Sugestões de álbuns")
+        popup.configure(bg=BG)
+        self._fade_in_window(popup)
+        popup.geometry("1100x780")
+        popup.minsize(680, 540)
+        popup.transient(self)
+        popup.grab_set()
+        popup.after_idle(lambda: self._apply_dark_titlebar(popup))
+
+        order = [path for path, _found in suggestions]
+        items = {
+            path: {"candidates": found, "choice": 0, "approved": found[0][2] >= FACE_SUGGESTION_STRONG}
+            for path, found in suggestions
+        }
+        cards = {}
+        all_label = "Todos os álbuns"
+        album_names = sorted({found[0][1] for _path, found in suggestions}, key=str.casefold)
+
+        heading = tk.Frame(popup, bg=BG)
+        heading.pack(fill="x", padx=22, pady=(18, 6))
+        tk.Label(
+            heading, text=f"Sugestões para {self._photo_count(len(order))}", bg=BG, fg=INK, font=("Inter", 19, "bold")
+        ).pack(anchor="w")
+        note = (
+            "Comparei os rostos das fotos novas com os dos seus álbuns. As sugestões fortes já vêm marcadas. "
+            "Clique numa foto para aprovar ou rejeitar e use “Outra sugestão” para trocar o álbum."
+        )
+        if without_match:
+            note += f" {self._photo_count(without_match)} sem rosto parecido ficam sem álbum."
+        tk.Label(heading, text=note, bg=BG, fg=MUTED, wraplength=1000, justify="left", font=("Inter", 10)).pack(
+            anchor="w", pady=(4, 0)
+        )
+
+        tools = tk.Frame(popup, bg=BG)
+        tools.pack(fill="x", padx=22, pady=(4, 10))
+        count_label = tk.Label(tools, text="", bg=BG, fg=self.accent, font=("Inter", 10, "bold"))
+        count_label.pack(side="left")
+        self._pill_button(tools, "Rejeitar visíveis", lambda: set_visible(False), width=156).pack(side="right", padx=4)
+        self._pill_button(tools, "Aprovar visíveis", lambda: set_visible(True), primary=True, width=156).pack(
+            side="right", padx=4
+        )
+        filter_var = tk.StringVar(value=all_label)
+        filter_control = self._rounded_dropdown(
+            tools, textvariable=filter_var, values=[all_label] + album_names, width=22
+        )
+        filter_control.pack(side="right", padx=(4, 12))
+
+        scroll_frame = tk.Frame(popup, bg=BG)
+        scroll_frame.pack(fill="both", expand=True, padx=22)
+        canvas = tk.Canvas(scroll_frame, bg=BG, highlightthickness=0)
+        inner = tk.Frame(canvas, bg=BG)
+        bar = SlimScrollbar(scroll_frame, command=canvas.yview)
+        bar._galeria_area = canvas
+        canvas._galeria_scrollbar = bar
+        canvas.configure(yscrollcommand=bar.set)
+        self._register_scroll_canvas(popup, canvas)
+        bar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox(window_id)))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window_id, width=event.width))
+
+        scope = f"album_suggestions:{id(popup)}"
+        render = {"generation": 1, "build_generation": 0, "index": 0, "thumb_size": None, "layout_after": None, "visible": []}
+        self._thumbnail_scope_generations[scope] = render["generation"]
+
+        def current(path):
+            info = items[path]
+            return info["candidates"][info["choice"]]
+
+        def update_count():
+            approved = sum(1 for info in items.values() if info["approved"])
+            count_label.configure(text=f"{approved} de {len(items)} aprovadas")
+
+        def refresh_card(path):
+            record = cards.get(path)
+            if not record:
+                return
+            approved = items[path]["approved"]
+            _album_id, album_name, score = current(path)
+            card_bg = self._blend_color(PANEL, self.accent, 0.12) if approved else PANEL
+            record["card"]._galeria_selected = approved
+            self._refresh_card_feedback(record["card"])
+            for key in ("card", "image_wrap", "caption", "status", "swap"):
+                record[key].configure(bg=card_bg)
+            percent = round(max(0.0, min(1.0, score)) * 100)
+            record["status"].configure(
+                text=f"{'✓ ' if approved else ''}{album_name} · {percent}%",
+                fg=self.accent if approved else MUTED,
+            )
+            record["badge"].configure(
+                text="✓" if approved else "",
+                bg=self.accent if approved else card_bg,
+                fg="#101010" if approved else card_bg,
+            )
+            if approved:
+                record["badge"].place(relx=1, x=-7, y=7, anchor="ne")
+            else:
+                record["badge"].place_forget()
+
+        def toggle(path):
+            items[path]["approved"] = not items[path]["approved"]
+            refresh_card(path)
+            update_count()
+
+        def cycle(path):
+            info = items[path]
+            info["choice"] = (info["choice"] + 1) % len(info["candidates"])
+            refresh_card(path)
+            return "break"
+
+        def set_visible(value):
+            for path in render["visible"]:
+                items[path]["approved"] = value
+                refresh_card(path)
+            update_count()
+
+        def dimensions():
+            width = max(1, canvas.winfo_width())
+            columns = max(1, min(7, width // 216))
+            card_width = max(150, (width - (columns - 1) * 12) // columns)
+            thumb_size = max(116, min(210, card_width - 20))
+            return columns, card_width, thumb_size
+
+        def layout_cards():
+            if not popup.winfo_exists():
+                return
+            columns, card_width, thumb_size = dimensions()
+            changed = render["thumb_size"] is not None and render["thumb_size"] != thumb_size
+            if changed:
+                render["generation"] += 1
+                self._thumbnail_scope_generations[scope] = render["generation"]
+                self._cancel_thumbnail_scope(scope)
+            for column in range(columns):
+                inner.grid_columnconfigure(column, weight=1, uniform="album-suggestions")
+            for index, (path, record) in enumerate(cards.items()):
+                record["card"].grid(row=index // columns, column=index % columns, sticky="nsew", padx=(0, 12), pady=(0, 12))
+                record["image_wrap"].configure(width=thumb_size, height=thumb_size)
+                record["caption"].configure(wraplength=card_width - 18)
+                if changed:
+                    self._request_thumbnail(path, (thumb_size, thumb_size), record["image"], scope, render["generation"])
+            render["thumb_size"] = thumb_size
+            inner.update_idletasks()
+            bounds = canvas.bbox(window_id)
+            canvas.configure(
+                scrollregion=bounds if bounds else (0, 0, max(1, canvas.winfo_width()), max(1, canvas.winfo_height()))
+            )
+
+        def schedule_layout(_event=None):
+            pending = render.get("layout_after")
+            if pending:
+                try:
+                    popup.after_cancel(pending)
+                except tk.TclError:
+                    pass
+            render["layout_after"] = popup.after(140, layout_cards)
+
+        def create_card(path, index):
+            columns, card_width, thumb_size = dimensions()
+            card = tk.Frame(inner, bg=PANEL, highlightbackground=LINE, highlightthickness=1, padx=8, pady=8, cursor="hand2")
+            self._bind_card_feedback(card, outline=LINE, always_outline=True)
+            card.grid(row=index // columns, column=index % columns, sticky="nsew", padx=(0, 12), pady=(0, 12))
+            image_wrap = tk.Frame(card, bg=PANEL, width=thumb_size, height=thumb_size)
+            image_wrap.pack(anchor="center")
+            image_wrap.pack_propagate(False)
+            image = tk.Label(image_wrap, text="…", bg=PANEL, fg=MUTED, bd=0, cursor="hand2", padx=0, pady=0)
+            image.place(relx=0, rely=0, relwidth=1, relheight=1)
+            badge = tk.Label(image_wrap, text="", font=("Inter", 9, "bold"), padx=6, pady=2)
+            caption = tk.Label(
+                card, text=Path(path).name[:36], bg=PANEL, fg=INK, font=("Inter", 9, "bold"),
+                anchor="w", justify="left", wraplength=card_width - 18,
+            )
+            caption.pack(fill="x", pady=(8, 2))
+            status = tk.Label(card, text="", bg=PANEL, fg=MUTED, font=("Inter", 8, "bold"), anchor="w")
+            status.pack(fill="x")
+            swap = tk.Label(
+                card,
+                text="Outra sugestão ›" if len(items[path]["candidates"]) > 1 else "",
+                bg=PANEL, fg=self.accent, font=("Inter", 8, "bold"), anchor="w", cursor="hand2",
+            )
+            swap.pack(fill="x", pady=(2, 0))
+            cards[path] = {
+                "card": card, "image_wrap": image_wrap, "image": image, "badge": badge,
+                "caption": caption, "status": status, "swap": swap,
+            }
+            for widget in (card, image_wrap, image, badge, caption, status):
+                widget.bind("<Button-1>", lambda _event, p=path: toggle(p))
+            if len(items[path]["candidates"]) > 1:
+                swap.bind("<Button-1>", lambda _event, p=path: cycle(p))
+            else:
+                swap.bind("<Button-1>", lambda _event, p=path: toggle(p))
+            refresh_card(path)
+            self._request_thumbnail(path, (thumb_size, thumb_size), image, scope, render["generation"])
+
+        def build_batch():
+            if not popup.winfo_exists():
+                return
+            generation = render["build_generation"]
+            visible = render["visible"]
+            start = render["index"]
+            stop = min(start + 24, len(visible))
+            for index in range(start, stop):
+                create_card(visible[index], index)
+            render["index"] = stop
+            layout_cards()
+            update_count()
+            if stop < len(visible):
+                popup.after_idle(lambda g=generation: build_batch() if g == render["build_generation"] else None)
+
+        def rebuild(_event=None):
+            self._cancel_thumbnail_scope(scope)
+            render["generation"] += 1
+            self._thumbnail_scope_generations[scope] = render["generation"]
+            render["build_generation"] += 1
+            for child in inner.winfo_children():
+                child.destroy()
+            cards.clear()
+            render["thumb_size"] = None
+            render["index"] = 0
+            wanted = filter_var.get()
+            render["visible"] = [path for path in order if wanted == all_label or current(path)[1] == wanted]
+            canvas.yview_moveto(0)
+            if not render["visible"]:
+                tk.Label(inner, text="Nenhuma foto para este álbum.", bg=BG, fg=MUTED, font=("Inter", 11)).grid(
+                    row=0, column=0, pady=45, sticky="nsew"
+                )
+            build_batch()
+
+        def confirm():
+            assignments = {}
+            for path in order:
+                info = items[path]
+                if not info["approved"] or not _safe_is_file(path):
+                    continue
+                album_id, album_name, _score = current(path)
+                assignments.setdefault(album_id, (album_name, []))[1].append(path)
+            if not assignments:
+                self._info("Nada aprovado", "Aprove ao menos uma foto para adicioná-la a um álbum.")
+                return
+            if self._start_suggestion_apply(assignments):
+                popup.destroy()
+
+        footer = tk.Frame(popup, bg=BG)
+        footer.pack(fill="x", padx=22, pady=16)
+        self._pill_button(footer, "Cancelar", popup.destroy, width=116).pack(side="right", padx=6)
+        self._pill_button(footer, "Adicionar aprovadas", confirm, primary=True, width=196).pack(side="right", padx=6)
+        filter_control.bind("<<ComboboxSelected>>", rebuild)
+        canvas.bind("<Configure>", schedule_layout, add="+")
+        popup.bind(
+            "<Destroy>",
+            lambda event: (
+                self._cancel_thumbnail_scope(scope),
+                self._thumbnail_scope_generations.pop(scope, None),
+            )
+            if event.widget is popup
+            else None,
+            add="+",
+        )
+        popup.bind("<Escape>", lambda _event: popup.destroy())
+        rebuild()
+
     def review_face_matches(self, paths, target_id, target_name):
-        paths = [path for path in paths if _safe_is_file(path)]
+        # Segurança extra: o álbum pode ter recebido fotos enquanto a busca rodava.
+        already_in_album = {os.path.normcase(path) for path in self.store.photos(album_id=target_id)}
+        paths = [path for path in paths if _safe_is_file(path) and os.path.normcase(path) not in already_in_album]
         if not paths:
-            self._info("Nenhuma correspondência", "Não encontrei fotos com um rosto suficientemente parecido com a referência.", parent=self)
+            self._info(
+                "Nenhuma foto nova",
+                f"Não encontrei fotos novas com um rosto parecido com a referência. As que já estão em “{target_name}” não são mostradas.",
+                parent=self,
+            )
             return
         popup = tk.Toplevel(self)
         popup.title("Revisar fotos encontradas")
@@ -7543,6 +8059,11 @@ class GalleryApp(tk.Tk):
                             f"{recovered} reconectadas" if recovered else None,
                         ]
                         self._info("Biblioteca atualizada", " · ".join(part for part in parts if part))
+                        imported_new = getattr(self, "_import_state", {}).get("new_paths", [])
+                        moved_map = {os.path.normcase(old): new for old, new in moved}
+                        final_new = [moved_map.get(os.path.normcase(path), path) for path in imported_new]
+                        if final_new:
+                            self.after(400, lambda paths=final_new: self._offer_face_suggestions(paths))
                 elif kind == "album_remove_progress":
                     _kind, done, total = msg
                     self._show_progress(f"Devolvendo fotos à pasta Biblioteca {done:,} de {total:,}…", done, total)
@@ -7661,6 +8182,40 @@ class GalleryApp(tk.Tk):
                     self.review_face_matches(matched, target_id, target_name)
                 elif kind == "duplicates":
                     self.review_duplicates(msg[1])
+                elif kind == "suggest_progress":
+                    _kind, done, total = msg
+                    self._show_progress(f"Analisando rostos {done:,} de {total:,}…", done, total)
+                elif kind == "suggest_done":
+                    _kind, results, unmatched = msg
+                    self._suggest_busy = False
+                    self.configure(cursor="")
+                    self._hide_progress()
+                    self.review_album_suggestions(results, unmatched)
+                elif kind == "suggest_error":
+                    self._suggest_busy = False
+                    self.configure(cursor="")
+                    self._hide_progress()
+                    self._info("Reconhecimento facial interrompido", msg[1])
+                elif kind == "suggestions_progress":
+                    _kind, done, total, name = msg
+                    self._show_progress(f"Adicionando aos álbuns {done:,} de {total:,}: {name}", done, total)
+                elif kind == "suggestions_applied":
+                    _kind, total, album_count, moved, skipped, errors = msg
+                    self._library_move_busy = False
+                    self.configure(cursor="")
+                    self._hide_progress()
+                    self.refresh_all()
+                    if errors:
+                        messagebox.showwarning(
+                            "Algumas fotos não foram adicionadas",
+                            " · ".join(errors[:3]),
+                            parent=self,
+                        )
+                    else:
+                        self._info(
+                            "Álbuns atualizados",
+                            f"{self._photo_count(total)} adicionada(s) a {album_count} álbum(ns).",
+                        )
                 elif kind == "error":
                     self.configure(cursor="")
                     self._hide_progress()
